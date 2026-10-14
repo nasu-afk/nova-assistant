@@ -1,0 +1,26 @@
+# Environments
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Data
+data/*.db
+data/*.sqlite3
+*.log
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# uv
+.python-version
