@@ -19,19 +19,30 @@ from app.voice.base import STTProvider, TTSProvider
 from app.voice.null_providers import NullSTTProvider, NullTTSProvider
 
 
+def _groq_voice_key(settings: Settings) -> str:
+    """Key used for Groq STT/TTS: NOVA_VOICE_API_KEY, else the LLM key *only if*
+    the LLM provider is Groq as well (never ship another vendor's key to Groq)."""
+    from app.config.settings import LLMProviderName
+
+    if settings.voice_api_key is not None:
+        return settings.voice_api_key.get_secret_value()
+    if settings.llm_api_key is not None and settings.llm_provider == LLMProviderName.GROQ:
+        return settings.llm_api_key.get_secret_value()
+    raise ConfigurationError(
+        "NOVA_VOICE_PROVIDER=groq needs a Groq key: set NOVA_VOICE_API_KEY "
+        "(or use NOVA_LLM_PROVIDER=groq so NOVA_LLM_API_KEY is reused).",
+        user_message="I don't have a Groq API key configured for voice yet.",
+    )
+
+
 def build_stt_provider(settings: Settings) -> STTProvider:
     if settings.voice_provider == VoiceProviderName.NONE:
         return NullSTTProvider()
 
     if settings.voice_provider == VoiceProviderName.GROQ:
-        if settings.llm_api_key is None:
-            raise ConfigurationError(
-                "NOVA_VOICE_PROVIDER=groq requires NOVA_LLM_API_KEY to be set.",
-                user_message="I don't have a Groq API key configured for voice yet.",
-            )
         from app.voice.groq_stt import GroqSTTProvider
 
-        return GroqSTTProvider(api_key=settings.llm_api_key.get_secret_value())
+        return GroqSTTProvider(api_key=_groq_voice_key(settings))
 
     if settings.voice_provider == VoiceProviderName.WHISPER_LOCAL:
         from app.voice.whisper_stt import WhisperSTTProvider
@@ -49,14 +60,9 @@ def build_tts_provider(settings: Settings) -> TTSProvider:
         return NullTTSProvider()
 
     if settings.voice_provider == VoiceProviderName.GROQ:
-        if settings.llm_api_key is None:
-            raise ConfigurationError(
-                "NOVA_VOICE_PROVIDER=groq requires NOVA_LLM_API_KEY to be set.",
-                user_message="I don't have a Groq API key configured for voice yet.",
-            )
         from app.voice.groq_tts import GroqTTSProvider
 
-        return GroqTTSProvider(api_key=settings.llm_api_key.get_secret_value())
+        return GroqTTSProvider(api_key=_groq_voice_key(settings))
 
     if settings.voice_provider == VoiceProviderName.WHISPER_LOCAL:
         # Whisper is STT-only; local TTS falls back to pyttsx3.

@@ -13,7 +13,9 @@ confirmation via the security layer.
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
+import re
 from typing import Any, ClassVar
 
 import psutil
@@ -21,6 +23,57 @@ import psutil
 from app.core.enums import RiskLevel
 from app.core.errors import ValidationError
 from app.tools.base import Tool, ToolMetadata, ToolResult
+
+# A launchable program is a bare name like "notepad" / "code" / "chrome". Paths,
+# drive letters, spaces and shell metacharacters are rejected: os.startfile()
+# will happily *execute* any file it is handed (installers, .bat, .js, .hta ...),
+# and this tool is LOW risk with no confirmation.
+_BARE_PROGRAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+_DANGEROUS_EXTENSIONS = frozenset(
+    {
+        ".bat",
+        ".cmd",
+        ".com",
+        ".js",
+        ".jse",
+        ".vbs",
+        ".vbe",
+        ".wsf",
+        ".wsh",
+        ".hta",
+        ".ps1",
+        ".msi",
+        ".msc",
+        ".scr",
+        ".lnk",
+        ".reg",
+        ".jar",
+        ".dll",
+        ".cpl",
+        ".url",
+    }
+)
+
+# Never terminated by close_application, whatever the model asks for.
+_PROTECTED_PROCESSES = frozenset(
+    {
+        "system",
+        "registry",
+        "smss",
+        "csrss",
+        "wininit",
+        "winlogon",
+        "services",
+        "lsass",
+        "svchost",
+        "explorer",
+        "dwm",
+        "fontdrvhost",
+        "init",
+        "systemd",
+        "launchd",
+    }
+)
 
 
 class OpenApplicationTool(Tool):
@@ -50,11 +103,14 @@ class OpenApplicationTool(Tool):
             raise ValidationError(
                 f"open_application got a URL ({name!r}); use open_webpage for URLs instead."
             )
-        if " " in name:
+        if not _BARE_PROGRAM.fullmatch(name):
             raise ValidationError(
-                f"open_application takes a bare program name, not a command line "
+                f"open_application takes a bare program name, not a path or command line "
                 f"({name!r}); pass just the program (e.g. 'chrome')."
             )
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix in _DANGEROUS_EXTENSIONS:
+            raise ValidationError(f"open_application won't launch {suffix} files ({name!r}).")
         return {"name": name}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -96,16 +152,35 @@ class CloseApplicationTool(Tool):
         name = payload.get("name")
         if not name or not isinstance(name, str):
             raise ValidationError("close_application requires a 'name' string")
-        return {"name": name.strip().lower()}
+        name = name.strip().lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        if len(name) < 3:
+            # A 1-2 letter "name" used to substring-match (and kill) half the machine.
+            raise ValidationError(f"close_application needs the full program name (got {name!r}).")
+        if name in _PROTECTED_PROCESSES:
+            raise ValidationError(f"I won't close '{name}': it's a core system process.")
+        return {"name": name}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
         name = payload["name"]
         killed = []
+        # Never terminate NOVA itself or the shell/terminal that launched it.
+        protected_pids = {os.getpid()}
+        try:
+            protected_pids.update(p.pid for p in psutil.Process().parents())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
         for proc in psutil.process_iter(["pid", "name"]):
             try:
-                if name in (proc.info["name"] or "").lower():
-                    proc.terminate()
-                    killed.append(proc.info["pid"])
+                proc_name = (proc.info["name"] or "").lower()
+                if proc_name.endswith(".exe"):
+                    proc_name = proc_name[:-4]
+                # Exact match (not substring): "note" must not hit "notepad".
+                if proc_name != name or proc.info["pid"] in protected_pids:
+                    continue
+                proc.terminate()
+                killed.append(proc.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 

@@ -107,11 +107,19 @@ class PushToTalkListener:
                 user_message="Push-to-talk isn't available in this environment.",
             ) from exc
 
+        # pynput stops delivering events if a callback raises, which would
+        # silently disable push-to-talk for the rest of the session.
         def on_press(key: Any) -> None:
-            self._handle_press(self._normalize_pynput_key(key, keyboard))
+            try:
+                self._handle_press(self._normalize_pynput_key(key, keyboard))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("push_to_talk_press_failed", error=str(exc))
 
         def on_release(key: Any) -> None:
-            self._handle_release(self._normalize_pynput_key(key, keyboard))
+            try:
+                self._handle_release(self._normalize_pynput_key(key, keyboard))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("push_to_talk_release_failed", error=str(exc))
 
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._listener.start()

@@ -11,6 +11,7 @@ ever invoke one known binary with a fixed, safe subcommand shape.
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -22,9 +23,24 @@ from app.security.manager import CommandPolicy
 from app.tools.base import Tool, ToolMetadata, ToolResult
 
 
+def split_command(command: str) -> list[str]:
+    """Split a command line into argv.
+
+    POSIX-mode `shlex.split` treats backslashes as escapes, which silently turns
+    `C:\\Users\\me\\x.py` into `C:Usersmex.py` on Windows; use non-POSIX mode
+    there and strip the surrounding quotes it leaves in place.
+    """
+    if os.name != "nt":
+        return shlex.split(command)
+    parts = shlex.split(command, posix=False)
+    return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
+
+
 async def _run(
     program: str, args: list[str], cwd: str | None, timeout_seconds: int
 ) -> tuple[int, str, str]:
+    if cwd is not None and not os.path.isdir(cwd):  # noqa: ASYNC240 - one cheap stat
+        return 1, "", f"'{cwd}' is not a valid working directory."
     try:
         proc = await asyncio.create_subprocess_exec(
             program,
@@ -35,6 +51,8 @@ async def _run(
         )
     except FileNotFoundError as exc:
         return 127, "", f"'{program}' is not installed or not on PATH: {exc}"
+    except OSError as exc:
+        return 126, "", f"Couldn't start '{program}': {exc}"
 
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
@@ -54,6 +72,14 @@ class RunCommandTool(Tool):
         description="Run a shell command (program + args), subject to the command policy.",
         risk_level=RiskLevel.HIGH,
         requires_confirmation=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Program and arguments to run"},
+                "cwd": {"type": "string", "description": "Working directory (optional)"},
+            },
+            "required": ["command"],
+        },
     )
 
     def __init__(self, policy: CommandPolicy | None = None) -> None:
@@ -74,7 +100,10 @@ class RunCommandTool(Tool):
         if not allowed:
             return ToolResult(success=False, error=f"Blocked by command policy: {reason}")
 
-        parts = shlex.split(command)
+        try:
+            parts = split_command(command)
+        except ValueError as exc:
+            return ToolResult(success=False, error=f"Couldn't parse the command: {exc}")
         if not parts:
             return ToolResult(success=False, error="Empty command.")
 
@@ -108,6 +137,15 @@ class GitStatusTool(_RepoTool):
         name="git_status",
         description="Show the working tree status of a git repository.",
         risk_level=RiskLevel.LOW,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Project/repo directory (default: current folder)",
+                }
+            },
+        },
     )
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -123,11 +161,25 @@ class GitLogTool(_RepoTool):
         name="git_log",
         description="Show recent commit history of a git repository.",
         risk_level=RiskLevel.LOW,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Project/repo directory (default: current folder)",
+                },
+                "limit": {"type": "integer", "description": "How many commits (1-100, default 10)"},
+            },
+        },
     )
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         base = super().validate_input(payload)
-        base["limit"] = int(payload.get("limit", 10))
+        try:
+            limit = int(payload.get("limit", 10))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValidationError("git_log 'limit' must be an integer") from exc
+        base["limit"] = max(1, min(limit, 100))
         return base
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -145,6 +197,19 @@ class RunPythonTool(_RepoTool):
         name="run_python",
         description="Run a Python script and capture its output.",
         risk_level=RiskLevel.MEDIUM,
+        requires_confirmation=True,  # runs arbitrary code
+        input_schema={
+            "type": "object",
+            "properties": {
+                "script": {"type": "string", "description": "Path of the .py file to run"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Project/repo directory (default: current folder)",
+                },
+            },
+            "required": ["script"],
+        },
     )
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -153,7 +218,10 @@ class RunPythonTool(_RepoTool):
         if not script or not isinstance(script, str):
             raise ValidationError("run_python requires a 'script' path")
         base["script"] = script
-        base["args"] = [str(a) for a in payload.get("args", [])]
+        args = payload.get("args") or []
+        if not isinstance(args, list):
+            raise ValidationError("run_python 'args' must be a list")
+        base["args"] = [str(a) for a in args]
         return base
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -175,12 +243,32 @@ def _build_manager_tool(
 
     class _ManagerTool(_RepoTool):
         metadata: ClassVar[ToolMetadata] = ToolMetadata(
-            name=name, description=description, risk_level=RiskLevel.MEDIUM
+            name=name,
+            description=description,
+            risk_level=RiskLevel.MEDIUM,
+            requires_confirmation=True,  # build tools run arbitrary project scripts/plugins
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": f"Arguments (default: {' '.join(default_args)})",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Project/repo directory (default: current folder)",
+                    },
+                },
+            },
         )
 
         def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
             base = super().validate_input(payload)
-            base["args"] = [str(a) for a in payload.get("args", default_args)]
+            args = payload.get("args") or default_args
+            if not isinstance(args, list):
+                raise ValidationError(f"{name} 'args' must be a list")
+            base["args"] = [str(a) for a in args]
             return base
 
         async def execute(self, payload: dict[str, Any]) -> ToolResult:

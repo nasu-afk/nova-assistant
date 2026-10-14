@@ -81,9 +81,7 @@ async def test_single_tool_call_executes_and_summarizes(registry: ToolRegistry) 
         [
             LLMResponse(
                 content="",
-                tool_calls=[
-                    {"id": "1", "name": "open_application", "input": {"name": "notepad"}}
-                ],
+                tool_calls=[{"id": "1", "name": "open_application", "input": {"name": "notepad"}}],
             ),
             LLMResponse(content="I opened Notepad for you."),
         ]
@@ -94,7 +92,7 @@ async def test_single_tool_call_executes_and_summarizes(registry: ToolRegistry) 
 
     assert reply == "I opened Notepad for you."
     # The tool result should have been folded into history before the final call.
-    assert any("Opened notepad" in m.content for m in agent.history if m.role == "assistant")
+    assert any("Opened notepad" in m.content for m in agent.history if m.role == "user")
 
 
 @pytest.mark.asyncio
@@ -112,16 +110,14 @@ async def test_tool_call_with_unregistered_tool_reports_failure(registry: ToolRe
     reply = await agent.respond("do the thing")
 
     assert reply == "Sorry, that didn't work."
-    assert any("failed" in m.content for m in agent.history if m.role == "assistant")
+    assert any("failed" in m.content for m in agent.history if m.role == "user")
 
 
 @pytest.mark.asyncio
 async def test_failing_tool_reports_error_in_summary(registry: ToolRegistry) -> None:
     llm = ScriptedToolLLM(
         [
-            LLMResponse(
-                content="", tool_calls=[{"id": "1", "name": "always_fails", "input": {}}]
-            ),
+            LLMResponse(content="", tool_calls=[{"id": "1", "name": "always_fails", "input": {}}]),
             LLMResponse(content="That failed because the disk is full."),
         ]
     )
@@ -319,9 +315,7 @@ async def test_tool_lifecycle_events_are_published(registry: ToolRegistry) -> No
         [
             LLMResponse(
                 content="",
-                tool_calls=[
-                    {"id": "1", "name": "open_application", "input": {"name": "notepad"}}
-                ],
+                tool_calls=[{"id": "1", "name": "open_application", "input": {"name": "notepad"}}],
             ),
             LLMResponse(content="Opened it."),
         ]

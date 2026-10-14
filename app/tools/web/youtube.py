@@ -115,6 +115,8 @@ class PlayYoutubeVideoTool(Tool):
 
         if payload["fullscreen"]:
             try:
+                # Pressing "f" while the watch page is still loading goes nowhere.
+                await page.wait_for_selector("video", timeout=10_000)
                 await page.keyboard.press("f")
             except Exception:  # noqa: BLE001 - fullscreen is best-effort, never fails the tool
                 pass
@@ -130,6 +132,21 @@ class PlayYoutubeVideoTool(Tool):
             message=f"Playing the first YouTube result for '{query}'. Ads will be auto-skipped.",
             data={"query": query},
         )
+
+    async def aclose(self) -> None:
+        """Stop the ad watcher and close the browser (called at NOVA shutdown)."""
+        task = self._ad_skip_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._ad_skip_task = None
+        try:
+            await self._session.stop()
+        except Exception:  # noqa: BLE001 - shutting down; nothing more to do
+            pass
 
     async def _try_skip_ad_once(self, page: Any) -> bool:
         """Click the Skip Ad button if it's currently visible. Returns True

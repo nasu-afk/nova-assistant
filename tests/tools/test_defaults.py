@@ -40,11 +40,11 @@ async def test_low_risk_tool_runs_without_confirmation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_high_risk_tool_without_prompt_requires_confirmation_error() -> None:
-    registry = build_default_registry(confirmation_prompt=None)
+async def test_high_risk_tool_without_prompt_requires_confirmation_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    registry = build_default_registry(confirmation_prompt=None, workspace_root=tmp_path)
 
     with pytest.raises(ConfirmationRequiredError):
-        await registry.invoke("delete_file", {"path": "/tmp/does-not-matter"})
+        await registry.invoke("delete_file", {"path": str(tmp_path / "does-not-matter")})
 
 
 @pytest.mark.asyncio
@@ -54,7 +54,7 @@ async def test_high_risk_tool_with_approved_prompt_proceeds(tmp_path) -> None:  
 
     target = tmp_path / "to_delete.txt"
     target.write_text("bye")
-    registry = build_default_registry(confirmation_prompt=always_yes)
+    registry = build_default_registry(confirmation_prompt=always_yes, workspace_root=tmp_path)
 
     result = await registry.invoke("delete_file", {"path": str(target)})
 
@@ -71,7 +71,7 @@ async def test_high_risk_tool_with_declined_prompt_does_not_run(tmp_path) -> Non
 
     target = tmp_path / "keep_me.txt"
     target.write_text("still here")
-    registry = build_default_registry(confirmation_prompt=always_no)
+    registry = build_default_registry(confirmation_prompt=always_no, workspace_root=tmp_path)
 
     with pytest.raises(PermissionDeniedError):
         await registry.invoke("delete_file", {"path": str(target)})

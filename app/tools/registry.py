@@ -16,6 +16,17 @@ from app.tools.base import Tool, ToolMetadata, ToolResult
 logger = get_logger(__name__)
 
 
+def shorten_for_log(value: Any, limit: int = 200) -> Any:
+    """Shorten long strings (e.g. whole file contents) before they hit the logs."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else f"{value[:limit]}…(+{len(value) - limit} chars)"
+    if isinstance(value, dict):
+        return {k: shorten_for_log(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [shorten_for_log(v, limit) for v in value]
+    return value
+
+
 class PermissionGate(Protocol):
     """What the registry needs from the security layer (Phase 7).
 
@@ -60,6 +71,10 @@ class ToolRegistry:
             raise ToolNotFoundError(f"No tool registered with name '{name}'")
         return tool
 
+    def iter_tools(self) -> list[Tool]:
+        """Registered tool instances (e.g. so shutdown can close ones holding resources)."""
+        return list(self._tools.values())
+
     def list_metadata(self) -> list[ToolMetadata]:
         """Return metadata for every registered tool (e.g. to hand to the LLM
         as its available-tools list)."""
@@ -98,15 +113,17 @@ class ToolRegistry:
         """Run the full validate -> permission -> execute -> log pipeline."""
         tool = self.get(name)
 
-        logger.info("tool_requested", tool=name, payload=payload)
+        logger.info("tool_requested", tool=name, payload=shorten_for_log(payload))
         try:
             validated = tool.validate_input(payload)
+            # Tool-level checks (e.g. path confinement) run first so the user is
+            # never asked to approve an action that would be refused anyway.
+            tool.check_permission(validated)
             confirm = getattr(self._gate, "check_and_confirm", None)
             if confirm is not None:
                 await confirm(tool, validated)
             else:
                 self._gate.check(tool, validated)
-            tool.check_permission(validated)
 
             logger.info("tool_started", tool=name)
             result = await tool.execute(validated)

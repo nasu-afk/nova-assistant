@@ -17,14 +17,18 @@ or the event wiring changes because of them.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -39,6 +43,7 @@ from PySide6.QtWidgets import (
 
 from app.core.enums import EventType
 from app.events.bus import Event, EventBus
+from app.security.manager import summarize_payload
 
 # Palette: deep-space background, cyan as the primary "system online" accent,
 # violet as a secondary accent, and one status color per agent state so the
@@ -48,21 +53,33 @@ _PANEL = "#0b1220"
 _PANEL_ALT = "#0e1626"
 _BORDER = "#1c2b45"
 _CYAN = "#00e5ff"
-_VIOLET = "#7c4dff"
+_VIOLET = "#9d7bff"  # lightened from #7c4dff: was 3.8-4.2:1, now >= 5.8:1
 _TEXT = "#dce9ff"
-_TEXT_DIM = "#5f7396"
+_TEXT_DIM = "#8ba0c2"  # lightened from #5f7396: was 3.8-4.2:1, now >= 6.8:1
 _SUCCESS = "#39ff9c"
 
 _STATUS_COLORS = {
-    "idle": "#5f7396",
+    "idle": _TEXT_DIM,
     "listening": "#00e5ff",
     "thinking": "#ffb300",
-    "speaking": "#7c4dff",
+    "speaking": _VIOLET,
     "working": "#00e5ff",
     "error": "#ff4d6d",
 }
 
 _MONO_FONT_FAMILIES = "Cascadia Code, Consolas, 'Courier New', monospace"
+
+_FONT_SIZE_RE = re.compile(r"font-size:\s*(\d+(?:\.\d+)?)px")
+MIN_TEXT_SCALE, MAX_TEXT_SCALE = 0.8, 2.0
+
+
+def _scaled_style_sheet(style_sheet: str, scale: float) -> str:
+    """The stylesheet with every px font size multiplied by `scale`, so the whole
+    window (not just one widget) grows for people who need larger text."""
+    return _FONT_SIZE_RE.sub(
+        lambda m: f"font-size: {round(float(m.group(1)) * scale)}px", style_sheet
+    )
+
 
 _STYLE_SHEET = f"""
 QMainWindow, QWidget#centralPanel {{
@@ -119,6 +136,12 @@ QPushButton#pttButton:hover {{
 QPushButton#pttButton:pressed {{
     background-color: {_CYAN};
     color: {_BG};
+}}
+
+QPushButton#pttButton:disabled {{
+    background-color: {_PANEL};
+    border: 1px dashed {_BORDER};
+    color: {_TEXT_DIM};
 }}
 
 QTabWidget::pane {{
@@ -205,11 +228,61 @@ QScrollBar::handle:vertical:hover {{
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
 }}
+
+QLineEdit {{
+    background-color: {_PANEL_ALT};
+    border: 1px solid {_BORDER};
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: {_TEXT};
+    font-size: 13px;
+    selection-background-color: {_VIOLET};
+    selection-color: {_BG};
+}}
+
+QPushButton#sendButton {{
+    background-color: {_PANEL_ALT};
+    border: 1px solid {_CYAN};
+    border-radius: 6px;
+    color: {_CYAN};
+    font-weight: 700;
+    padding: 8px 16px;
+}}
+
+QPushButton#sendButton:hover {{
+    background-color: #0f1e33;
+}}
+
+QCheckBox {{
+    color: {_TEXT};
+    spacing: 8px;
+    font-size: 12px;
+}}
+
+/* Keyboard focus must be obvious (never rely on the OS default on a dark theme). */
+QLineEdit:focus, QPushButton:focus, QCheckBox:focus, QTabBar::tab:focus,
+QTextEdit:focus, QListWidget:focus {{
+    border: 2px solid {_CYAN};
+}}
 """
 
 
 class MainWindow(QMainWindow):
     """The main NOVA application window."""
+
+    # Emitted when the user closes the window, so the app can shut down
+    # gracefully (stop listeners, close the DB/browser) instead of the Qt loop
+    # just dying underneath running coroutines.
+    closed = Signal()
+    # On-screen controls, so the window is usable without the global hotkey:
+    # hold-to-talk (pressed/released) and typed requests (text, read-aloud?).
+    talk_pressed = Signal()
+    talk_released = Signal()
+    text_submitted = Signal(str, bool)
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
+        self.closed.emit()
+        super().closeEvent(event)
 
     def __init__(self) -> None:
         super().__init__()
@@ -217,7 +290,7 @@ class MainWindow(QMainWindow):
         self.resize(960, 640)
         self.setStyleSheet(_STYLE_SHEET)
 
-        self._status_label = QLabel("Idle")
+        self._status_label = QLabel("IDLE")
         self._status_label.setObjectName("statusLabel")
         self._status_dot = QLabel("●")
         self._status_dot.setObjectName("statusDot")
@@ -237,11 +310,30 @@ class MainWindow(QMainWindow):
         self._push_to_talk_button = QPushButton("HOLD TO TALK")
         self._push_to_talk_button.setObjectName("pttButton")
         self._push_to_talk_button.setMinimumHeight(44)
+        # Reachable with Tab (hold Space while focused to talk), but a mouse
+        # click doesn't steal focus - otherwise the global Ctrl+Space hotkey would
+        # also "press" the focused button and start two recordings.
+        self._push_to_talk_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self._push_to_talk_button.pressed.connect(self._on_talk_pressed)
+        self._push_to_talk_button.released.connect(self._on_talk_released)
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("Type a request and press Enter…")
+        self._input.returnPressed.connect(self._submit_text)
+        self._send_button = QPushButton("Send")
+        self._send_button.setObjectName("sendButton")
+        self._send_button.clicked.connect(self._submit_text)
+        self._speak_checkbox = QCheckBox("Read replies aloud")
+
+        self._text_scale = 1.0
+        self._status_state = "idle"
 
         self._apply_glow(self._push_to_talk_button, QColor(_CYAN), radius=18)
         self._set_status_color("idle")
 
         self._build_layout()
+        self._apply_accessibility_metadata()
+        self._install_shortcuts()
 
     @staticmethod
     def _apply_glow(widget: QWidget, color: QColor, radius: int = 16) -> None:
@@ -255,9 +347,11 @@ class MainWindow(QMainWindow):
         widget.setGraphicsEffect(effect)
 
     def _set_status_color(self, state: str) -> None:
+        self._status_state = state
         color = _STATUS_COLORS.get(state, _STATUS_COLORS["idle"])
         self._status_label.setStyleSheet(f"color: {color};")
-        self._status_dot.setStyleSheet(f"color: {color}; font-size: 16px;")
+        dot_size = round(16 * getattr(self, "_text_scale", 1.0))
+        self._status_dot.setStyleSheet(f"color: {color}; font-size: {dot_size}px;")
         self._apply_glow(self._status_dot, QColor(color), radius=14)
 
     def _build_layout(self) -> None:
@@ -269,7 +363,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_header())
 
-        tabs = QTabWidget()
+        layout.addWidget(self._build_input_row())
+
+        tabs = self._tabs = QTabWidget()
         tabs.addTab(self._build_conversation_tab(), "Conversation")
         tabs.addTab(self._build_activity_tab(), "Activity")
         tabs.addTab(self._memory_view, "Memory")
@@ -277,6 +373,137 @@ class MainWindow(QMainWindow):
         layout.addWidget(tabs)
 
         self.setCentralWidget(central)
+
+        # Tab order follows how people use it: type, send, read-aloud, talk, then
+        # the content tabs (the default order put the talk button first).
+        self.setTabOrder(self._input, self._send_button)
+        self.setTabOrder(self._send_button, self._speak_checkbox)
+        self.setTabOrder(self._speak_checkbox, self._push_to_talk_button)
+        self.setTabOrder(self._push_to_talk_button, tabs)
+
+    def _build_input_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self._input, 1)
+        layout.addWidget(self._send_button)
+        layout.addWidget(self._speak_checkbox)
+        return row
+
+    def _apply_accessibility_metadata(self) -> None:
+        """Names/descriptions for screen readers and tooltips for everyone. Qt
+        exposes these through the platform accessibility API (UI Automation on
+        Windows, so Narrator/NVDA can read them)."""
+
+        def describe(widget: QWidget, name: str, description: str = "") -> None:
+            widget.setAccessibleName(name)
+            if description:
+                widget.setAccessibleDescription(description)
+                widget.setToolTip(description)
+
+        describe(self, "NOVA voice assistant")
+        describe(
+            self._push_to_talk_button,
+            "Hold to talk",
+            "Hold down to record, release to send. Hold Space while this button is "
+            "focused, or use the global push-to-talk hotkey.",
+        )
+        describe(
+            self._input,
+            "Type a request",
+            "Type a request for NOVA and press Enter. Shortcut: Ctrl+L.",
+        )
+        describe(self._send_button, "Send request", "Send the typed request to NOVA.")
+        describe(
+            self._speak_checkbox,
+            "Read replies aloud",
+            "When ticked, NOVA also speaks the reply to a typed request.",
+        )
+        describe(self._status_label, "Status: IDLE")
+        describe(self._mic_label, "Microphone status")
+        describe(self._transcript_view, "Transcript of what you said")
+        describe(self._conversation_view, "Conversation history")
+        describe(self._task_label, "Current task")
+        describe(self._progress_bar, "Task progress")
+        describe(self._tool_activity_list, "Tool activity")
+        describe(self._log_list, "Logs")
+        describe(self._memory_view, "Memory")
+        describe(self._tabs, "Sections")
+        # The glowing dot only duplicates the status text; hide it from readers.
+        self._status_dot.setAccessibleName("")
+
+    def _install_shortcuts(self) -> None:
+        def bind(sequence: str, callback: Any) -> None:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+
+        bind("Ctrl+L", self.focus_input)
+        bind("Ctrl+=", self.increase_text_size)
+        bind("Ctrl++", self.increase_text_size)
+        bind("Ctrl+-", self.decrease_text_size)
+        bind("Ctrl+0", self.reset_text_size)
+
+    # --- On-screen controls ---
+
+    def _on_talk_pressed(self) -> None:
+        self.talk_pressed.emit()
+
+    def _on_talk_released(self) -> None:
+        self.talk_released.emit()
+
+    def _submit_text(self) -> None:
+        text = self._input.text().strip()
+        if not text:
+            return
+        self._input.clear()
+        self.text_submitted.emit(text, self._speak_checkbox.isChecked())
+
+    def set_voice_available(self, available: bool, reason: str = "") -> None:
+        """Switch the voice controls off (e.g. no microphone) while leaving typing
+        fully working, and say why in a way screen readers pick up."""
+        self._push_to_talk_button.setEnabled(available)
+        if available:
+            self._mic_label.setText("Microphone: off")
+            self._push_to_talk_button.setText("HOLD TO TALK")
+            self._push_to_talk_button.setAccessibleName("Hold to talk")
+            self._apply_glow(self._push_to_talk_button, QColor(_CYAN), radius=18)
+            return
+        # Look disabled too (no glow, dashed outline, says why), not just *be* disabled.
+        self._push_to_talk_button.setText("VOICE UNAVAILABLE — TYPE BELOW")
+        self._push_to_talk_button.setGraphicsEffect(None)  # type: ignore[arg-type]  # Qt accepts None
+        detail = (
+            f"Voice input isn't available: {reason}" if reason else "Voice input isn't available."
+        )
+        self._mic_label.setText("Microphone: unavailable")
+        self._push_to_talk_button.setAccessibleName("Hold to talk (unavailable)")
+        self._push_to_talk_button.setAccessibleDescription(f"{detail} You can still type requests.")
+        self._push_to_talk_button.setToolTip(f"{detail} You can still type requests.")
+
+    def focus_input(self) -> None:
+        self._input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._input.selectAll()
+
+    # --- Text size (Ctrl+= / Ctrl+- / Ctrl+0) ---
+
+    @property
+    def text_scale(self) -> float:
+        return self._text_scale
+
+    def set_text_scale(self, scale: float) -> None:
+        scale = round(min(MAX_TEXT_SCALE, max(MIN_TEXT_SCALE, scale)), 2)
+        self._text_scale = scale
+        self.setStyleSheet(_scaled_style_sheet(_STYLE_SHEET, scale))
+        self._set_status_color(self._status_state)
+
+    def increase_text_size(self) -> None:
+        self.set_text_scale(self._text_scale + 0.1)
+
+    def decrease_text_size(self) -> None:
+        self.set_text_scale(self._text_scale - 0.1)
+
+    def reset_text_size(self) -> None:
+        self.set_text_scale(1.0)
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -333,8 +560,20 @@ class MainWindow(QMainWindow):
 
     # --- Plain update methods: the only surface the rest of the app touches ---
 
+    @staticmethod
+    def _notify_accessibility(widget: QWidget, event: QAccessible.Event) -> None:
+        """Tell screen readers something changed. Best effort: a no-op when no
+        assistive technology is running (and in headless tests)."""
+        try:
+            if QAccessible.isActive():
+                QAccessible.updateAccessibility(QAccessibleEvent(widget, event))
+        except Exception:  # noqa: BLE001 - accessibility must never break the UI
+            pass
+
     def set_status(self, text: str) -> None:
         self._status_label.setText(text.upper())
+        self._status_label.setAccessibleName(f"Status: {text.upper()}")
+        self._notify_accessibility(self._status_label, QAccessible.Event.NameChanged)
         state = text.strip().lower().split()[0] if text.strip() else "idle"
         if "error" in text.lower() or "unavailable" in text.lower() or "failed" in text.lower():
             state = "error"
@@ -350,6 +589,10 @@ class MainWindow(QMainWindow):
         color = _CYAN if role.lower() in {"you", "user"} else _VIOLET
         label = f'<span style="color:{color};font-weight:600;">{html.escape(role)}:</span>'
         self._conversation_view.append(f"{label} {html.escape(text)}")
+        if role.lower() not in {"you", "user"}:
+            # Have a screen reader announce NOVA's reply as it arrives.
+            self._status_label.setAccessibleName(f"{role} says: {text[:400]}")
+            self._notify_accessibility(self._status_label, QAccessible.Event.Alert)
 
     def set_task(self, goal: str | None) -> None:
         self._task_label.setText(f"Task: {goal}" if goal else "No active task")
@@ -380,7 +623,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Confirm action",
-            f"NOVA wants to run '{tool_name}' with:\n{payload}\n\nAllow this?",
+            f"NOVA wants to run '{tool_name}' with:\n{summarize_payload(payload)}\n\nAllow this?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

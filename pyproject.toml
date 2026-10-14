@@ -17,6 +17,7 @@ dependencies = [
     "anthropic>=0.34",
     "groq>=0.11",
     "psutil>=6.0",
+    "pillow>=10.0",  # describe_screen / take_screenshot (PIL.ImageGrab)
 ]
 
 # Heavier / platform-specific dependencies are intentionally deferred to the

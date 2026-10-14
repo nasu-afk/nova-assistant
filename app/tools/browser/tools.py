@@ -9,7 +9,7 @@ individual tool calls.
 from __future__ import annotations
 
 from typing import Any, ClassVar
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from app.core.enums import RiskLevel
 from app.core.errors import BrowserError, ValidationError
@@ -38,6 +38,11 @@ class OpenUrlTool(_BrowserTool):
         url = payload.get("url")
         if not url or not isinstance(url, str):
             raise ValidationError("open_url requires a 'url' string")
+        # file:// would let the model read local files (then extract_text them),
+        # bypassing the file tools' workspace confinement; javascript:/chrome: are
+        # no better. Same rule as open_webpage.
+        if urlparse(url).scheme not in {"http", "https"}:
+            raise ValidationError(f"open_url only supports http/https URLs, got: {url!r}")
         return {"url": url}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -59,7 +64,7 @@ class NavigateTool(_BrowserTool):
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         direction = payload.get("direction")
-        if direction not in {"back", "forward", "reload"}:
+        if not isinstance(direction, str) or direction not in {"back", "forward", "reload"}:
             raise ValidationError("navigate requires 'direction' to be back/forward/reload")
         return {"direction": direction}
 
@@ -109,8 +114,8 @@ class TypeTextTool(_BrowserTool):
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         selector, text = payload.get("selector"), payload.get("text")
-        if not selector or text is None:
-            raise ValidationError("type requires 'selector' and 'text'")
+        if not selector or not isinstance(selector, str) or not isinstance(text, str):
+            raise ValidationError("type requires string 'selector' and 'text'")
         return {"selector": selector, "text": text}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
@@ -154,7 +159,10 @@ class BrowserScreenshotTool(_BrowserTool):
     )
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {"path": payload.get("path", "page_screenshot.png")}
+        path = payload.get("path", "page_screenshot.png")
+        if not isinstance(path, str) or not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            raise ValidationError("browser_screenshot only writes .png/.jpg files")
+        return {"path": path}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
         page = await self._ensure_started()

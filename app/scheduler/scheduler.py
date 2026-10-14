@@ -56,10 +56,16 @@ class TaskScheduler:
         return job
 
     async def _run_once(self, job: ScheduledJob, callback: ScheduledCallback) -> None:
-        await asyncio.sleep(job.delay_seconds)
-        if job.cancelled:
-            return
-        await self._invoke(job, callback)
+        try:
+            await asyncio.sleep(job.delay_seconds)
+            if job.cancelled:
+                return
+            await self._invoke(job, callback)
+        finally:
+            # A finished one-shot job is not "active"; don't keep it forever.
+            job.cancelled = True
+            self._jobs.pop(job.id, None)
+            self._tasks.pop(job.id, None)
 
     async def _run_recurring(self, job: ScheduledJob, callback: ScheduledCallback) -> None:
         while not job.cancelled:

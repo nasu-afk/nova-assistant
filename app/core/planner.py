@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from pydantic import ValidationError as PydanticValidationError
+
 from app.ai.base import ChatMessage, LLMProvider
 from app.core.errors import ValidationError
 from app.core.logging import get_logger
@@ -56,17 +58,22 @@ class Planner:
         except json.JSONDecodeError as exc:
             raise PlanningError(f"Planner returned invalid JSON: {exc}. Raw: {raw!r}") from exc
 
+        if not isinstance(data, dict):
+            raise PlanningError(
+                f"Planner JSON must be an object, got {type(data).__name__}. Raw: {raw!r}"
+            )
+
         try:
             steps = [
                 PlanStep(
                     description=s["description"],
                     tool_name=s.get("tool_name"),
-                    tool_args=s.get("tool_args", {}),
+                    tool_args=s.get("tool_args") or {},
                 )
                 for s in data["steps"]
             ]
             return Plan(goal=data.get("goal", goal_hint), steps=steps)
-        except (KeyError, TypeError) as exc:
+        except (KeyError, TypeError, AttributeError, PydanticValidationError) as exc:
             raise PlanningError(
                 f"Planner JSON missing required fields: {exc}. Raw: {raw!r}"
             ) from exc

@@ -7,7 +7,7 @@ core agent code — this bus is the decoupling point (section 12).
 
 from __future__ import annotations
 
-import asyncio
+import inspect
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -15,6 +15,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.enums import EventType
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 EventHandler = Callable[["Event"], Awaitable[None] | None]
 
@@ -56,6 +59,14 @@ class EventBus:
         subscriber must never take down the agent.
         """
         for handler in list(self._handlers.get(event.type, [])):
-            result = handler(event)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = handler(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - one bad subscriber must not break the rest
+                logger.error(
+                    "event_handler_failed",
+                    event_type=str(event.type),
+                    handler=getattr(handler, "__qualname__", repr(handler)),
+                    error=str(exc),
+                )

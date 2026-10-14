@@ -8,11 +8,14 @@ from uuid import uuid4
 
 from sqlalchemy import select, update
 
+from app.core.logging import get_logger
 from app.database.engine import Database
 from app.database.models import ReminderRecord
 from app.scheduler.scheduler import TaskScheduler
 
 ReminderCallback = Callable[[str], Awaitable[None]]
+
+logger = get_logger(__name__)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -65,21 +68,31 @@ class PersistentReminderManager:
         delay = max(0.0, (_as_utc(record.due_at) - datetime.now(UTC)).total_seconds())
 
         async def fire() -> None:
+            # Settle the record no matter what: previously a delivery error (e.g.
+            # a TTS quota failure) skipped _mark_fired, so the reminder stayed
+            # "pending" and fired again on every single startup.
+            status = "fired"
             try:
                 await self._on_fire(record.message)
-                await self._mark_fired(record.id)
+            except Exception as exc:  # noqa: BLE001
+                status = "failed"
+                logger.error("reminder_delivery_failed", reminder_id=record.id, error=str(exc))
             finally:
                 self._scheduled.pop(record.id, None)
+                try:
+                    await self._mark_fired(record.id, status)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("reminder_mark_failed", reminder_id=record.id, error=str(exc))
 
         job = self._scheduler.schedule_once(fire, delay_seconds=delay, name=record.message)
         self._scheduled[record.id] = job.id
 
-    async def _mark_fired(self, reminder_id: str) -> None:
+    async def _mark_fired(self, reminder_id: str, status: str = "fired") -> None:
         async with self._db.session() as session:
             await session.execute(
                 update(ReminderRecord)
                 .where(ReminderRecord.id == reminder_id)
-                .values(status="fired", fired_at=datetime.now(UTC))
+                .values(status=status, fired_at=datetime.now(UTC))
             )
             await session.commit()
 
@@ -91,4 +104,3 @@ class PersistentReminderManager:
                 .order_by(ReminderRecord.due_at)
             )
             return list(result.scalars().all())
-

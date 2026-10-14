@@ -53,14 +53,17 @@ class AnthropicProvider(BaseLLMProvider):
         ]
 
     @classmethod
-    def _split_system(
-        cls, messages: list[ChatMessage]
-    ) -> tuple[str | None, list[dict[str, Any]]]:
+    def _split_system(cls, messages: list[ChatMessage]) -> tuple[str | None, list[dict[str, Any]]]:
         """Anthropic takes `system` as a separate top-level field, not a message."""
         system_parts = [m.content for m in messages if m.role == "system"]
         system = "\n".join(system_parts) if system_parts else None
         turns = [
-            {"role": m.role, "content": cls._to_anthropic_content(m)}
+            # Anthropic only accepts user/assistant turns; a "tool" turn is
+            # delivered as user-side content.
+            {
+                "role": "user" if m.role == "tool" else m.role,
+                "content": cls._to_anthropic_content(m),
+            }
             for m in messages
             if m.role != "system"
         ]
@@ -115,9 +118,7 @@ class AnthropicProvider(BaseLLMProvider):
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "tool_use":
-                tool_calls.append(
-                    {"id": block.id, "name": block.name, "input": block.input}
-                )
+                tool_calls.append({"id": block.id, "name": block.name, "input": block.input})
 
         return LLMResponse(
             content="".join(text_parts),

@@ -70,7 +70,7 @@ class LongTermMemory:
 
     async def list_all(self, category: str | None = None) -> list[MemoryRecord]:
         async with self._db.session() as session:
-            stmt = select(MemoryRecord)
+            stmt = select(MemoryRecord).order_by(MemoryRecord.created_at, MemoryRecord.id)
             if category:
                 stmt = stmt.where(MemoryRecord.category == category)
             result = await session.execute(stmt)

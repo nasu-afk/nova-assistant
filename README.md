@@ -198,8 +198,9 @@ docstring):
 - **Memory** (`app/tools/memory/tools.py`): `remember_fact`, `list_memories`,
   `forget_fact`, backed by the Phase 6 `LongTermMemory` and the same SQLite
   database as everything else (`NOVA_DATABASE_URL`) — facts persist across
-  restarts, not just within one run. `ToolCallingAgent` also injects every
-  stored fact into its system prompt fresh on every turn (not just when a
+  restarts, not just within one run. `ToolCallingAgent` also injects the 30 most
+  recent stored facts (one line each, length-capped, labelled as notes rather
+  than instructions) into its system prompt fresh on every turn (not just when a
   memory tool is explicitly called), so "I like lo-fi" now genuinely changes
   how NOVA answers "play me something" later, in the same or a future
   session, without the model needing to think to look it up.
@@ -247,7 +248,8 @@ voice, driven by `NOVA_VOICE_PROVIDER`:
 
 - `whisper_local` — `faster-whisper` for STT (downloads a model, runs
   offline) + `pyttsx3` for TTS (OS-native voices, fully offline).
-- `groq` — reuses `NOVA_LLM_API_KEY` for both `whisper-large-v3-turbo`
+- `groq` — uses `NOVA_VOICE_API_KEY`, or reuses `NOVA_LLM_API_KEY` **only when
+  `NOVA_LLM_PROVIDER=groq` too** (an Anthropic key is never sent to Groq), for both `whisper-large-v3-turbo`
   transcription and `canopylabs/orpheus-v1-english` speech, so one free key
   drives the whole voice loop with no local model download. Chat and STT
   have generous free-tier quotas; **TTS's free tier is much tighter**
@@ -409,3 +411,62 @@ in this environment. Screenshots to be added once verified on a real desktop._
 - Introduce a vector store behind the same `MemoryManager` interface once
   semantic recall is needed (Phase 6 ships with SQLite only).
 - Add a local-model `LLMProvider` implementation for fully offline use.
+
+
+## Safety defaults
+
+- **File tools are confined** to `NOVA_WORKSPACE_ROOT` (default: your home
+  folder). Credential files (`.env`, `.ssh/`, `*.pem`, ...) are always refused,
+  and the workspace root / home folder / drive roots can never be deleted or moved.
+  Overwriting an existing file (write/copy/move) asks for confirmation first.
+- **Developer tools** (`run_command`, git, npm, maven, gradle, docker) are off
+  unless `NOVA_ENABLE_DEVELOPER_TOOLS=true`; the ones that execute code always ask.
+- **Tool output is untrusted**: the model is told never to follow instructions
+  found in file contents or web pages, and memory facts are stored as single
+  length-capped lines labelled as notes, not instructions.
+- **Voice recordings are not kept** unless `NOVA_DEBUG_SAVE_AUDIO=true` (a very
+  quiet recording is still saved so the "check your microphone" hint works);
+  transcripts are logged by length only.
+- `close_application` matches the exact process name (>= 3 characters), never
+  touches core system processes, and never kills NOVA or its parent shell.
+
+
+## Wake word ("Hey NOVA")
+
+`--wakeword` mode uses [openWakeWord](https://github.com/dscripka/openWakeWord),
+which ships exactly four ready-made phrases: `alexa`, `hey_mycroft`,
+`hey_jarvis` (the default) and `hey_rhasspy`. **There is no ready-made "Hey
+NOVA" model**, so out of the box you say one of those phrases:
+
+```
+NOVA_WAKE_WORD_MODEL=hey_jarvis
+```
+
+To get a real "Hey NOVA", train a custom model with openWakeWord's own training
+notebook (see "Training New Models" in its repository; it generates synthetic
+speech, so no recording is required) and point NOVA at the file it produces:
+
+```
+NOVA_WAKE_WORD_MODEL=C:\models\hey_nova.onnx      # or a .tflite file
+```
+
+If the wake word is rarely detected, lower `NOVA_WAKE_VAD_THRESHOLD` (default
+200); in a noisy room raise it. Every audio chunk is fed to the model, and the
+loudness check only confirms a detection.
+
+## Window accessibility
+
+- **Type instead of speak**: the text box at the top sends a request (Enter);
+  tick "Read replies aloud" to have NOVA speak the reply. Works with no
+  microphone at all, and with no global hotkey.
+- **Keyboard**: Tab order is text box, Send, read-aloud, talk button, tabs.
+  Hold Space on the focused talk button to talk. `Ctrl+L` focuses the text box;
+  `Ctrl+=` / `Ctrl+-` / `Ctrl+0` make all text larger, smaller, or reset it
+  (80%-200%). The focused control has a thick cyan outline.
+- **Screen readers**: every control and list has an accessible name and
+  description, the status is announced as it changes, and each NOVA reply is
+  announced when it arrives.
+- **Contrast**: all text colours meet WCAG AA (4.5:1) on every panel.
+- The on-screen talk button, which was previously not connected to anything,
+  now works. When voice is unavailable the button says so and is visibly
+  disabled; the window remains a fully working text assistant.

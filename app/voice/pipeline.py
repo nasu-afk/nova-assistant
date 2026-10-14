@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from app.core.agent import RespondingAgent
 from app.core.enums import EventType
+from app.core.errors import NovaError
 from app.core.logging import get_logger
 from app.events.bus import Event, EventBus
 from app.voice.audio_capture import AudioRecorder
@@ -92,9 +93,15 @@ class VoicePipeline:
             logger.info("voice_transcription_empty")
             return ""
 
-        logger.info("voice_transcript_created", text=transcription.text)
+        # Log only the length: what the user said is not for the logs.
+        logger.info("voice_transcript_created", chars=len(transcription.text))
         await self._publish(EventType.TRANSCRIPT_CREATED, text=transcription.text)
 
         reply = await self._agent.respond(transcription.text)
-        await self._tts.speak(reply)
+        try:
+            await self._tts.speak(reply)
+        except NovaError as exc:
+            # The reply text is still valuable (console/GUI show it); a speech
+            # failure (quota, no output device) shouldn't discard it.
+            logger.error("voice_tts_failed", error=exc.message)
         return reply

@@ -11,6 +11,9 @@ assuming unlimited free speech synthesis.
 
 from __future__ import annotations
 
+import asyncio
+import io
+import re
 from typing import Any
 
 from app.core.errors import VoiceError
@@ -22,6 +25,36 @@ DEFAULT_VOICE = "autumn"
 # constant, so this exists to fail with a clear message locally rather than
 # silently sending an oversized request and getting back a 429/413.
 FREE_TIER_CHAR_GUIDELINE = 200
+
+
+def split_for_tts(text: str, limit: int = FREE_TIER_CHAR_GUIDELINE) -> list[str]:
+    """Split `text` into chunks of at most `limit` characters, preferring
+    sentence boundaries, then spaces. Groq's TTS rejects long inputs outright,
+    so a normal multi-sentence reply used to fail instead of being spoken."""
+    text = " ".join(text.split())
+    if not text:
+        return []
+    chunks: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > limit:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class GroqTTSProvider:
@@ -77,17 +110,22 @@ class GroqTTSProvider:
     async def speak(self, text: str) -> None:
         """Synthesize and play through the default output device.
 
-        Playback needs `sounddevice` + `soundfile` (part of the `voice`
-        extra) - imported lazily, same pattern as every other audio
-        dependency in this codebase.
+        Long replies are spoken chunk by chunk (see `split_for_tts`). Playback
+        runs in a worker thread: `sd.wait()` blocks until the audio ends, and
+        doing that on the event loop froze the whole app (and the GUI) for the
+        entire length of every reply.
+
+        Playback needs `sounddevice` + `soundfile` (part of the `voice` extra).
         """
-        audio_bytes = await self.synthesize(text)
-        if not audio_bytes:
-            return
+        for chunk in split_for_tts(text):
+            audio_bytes = await self.synthesize(chunk)
+            if not audio_bytes:
+                continue
+            await asyncio.to_thread(self._play_blocking, audio_bytes)
 
+    @staticmethod
+    def _play_blocking(audio_bytes: bytes) -> None:
         try:
-            import io
-
             import sounddevice as sd
             import soundfile as sf
         except ImportError as exc:  # pragma: no cover - exercised only if dep missing

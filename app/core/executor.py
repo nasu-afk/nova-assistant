@@ -67,17 +67,22 @@ class TaskExecutor:
                     EventType.TOOL_STARTED, plan, step_id=step.id, tool=step.tool_name
                 )
                 result = await self._registry.invoke(step.tool_name, step.tool_args)
-            except NovaError as exc:
+            except Exception as exc:  # noqa: BLE001 - a crashing tool fails its step, not the run
+                user_message = (
+                    exc.user_message
+                    if isinstance(exc, NovaError)
+                    else (f"{step.tool_name} failed unexpectedly: {exc}")
+                )
                 step.status = TaskStatus.FAILED
-                step.result_summary = exc.user_message
+                step.result_summary = user_message
                 await self._publish(
                     EventType.TOOL_FAILED,
                     plan,
                     step_id=step.id,
                     tool=step.tool_name,
-                    error=exc.user_message,
+                    error=user_message,
                 )
-                should_continue = await self._on_step_failed(plan, step, exc.user_message)
+                should_continue = await self._on_step_failed(plan, step, user_message)
                 if not should_continue:
                     plan.status = TaskStatus.FAILED
                     await self._publish(EventType.TASK_FAILED, plan, step_id=step.id)

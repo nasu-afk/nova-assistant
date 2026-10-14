@@ -67,6 +67,15 @@ class Tool(ABC):
         """
         return payload
 
+    def needs_confirmation(self, payload: dict[str, Any]) -> bool:
+        """Whether *this particular call* needs explicit user confirmation.
+
+        Defaults to the static `metadata.requires_confirmation`; tools can
+        override it for calls that are only risky some of the time (e.g.
+        overwriting a file that already exists).
+        """
+        return self.metadata.requires_confirmation
+
     def check_permission(self, payload: dict[str, Any]) -> None:
         """Raise `PermissionDeniedError` if this call should not proceed.
 

@@ -27,7 +27,7 @@ class SetVolumeTool(Tool):
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         level = payload.get("level")
-        if not isinstance(level, int | float) or not (0 <= level <= 100):
+        if isinstance(level, bool) or not isinstance(level, int | float) or not (0 <= level <= 100):
             raise ValidationError("set_volume requires a numeric 'level' between 0 and 100")
         return {"level": int(level)}
 
@@ -45,9 +45,13 @@ class SetVolumeTool(Tool):
             from comtypes import CLSCTX_ALL
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            speakers = AudioUtilities.GetSpeakers()
+            # Newer pycaw releases return a wrapper that exposes `.EndpointVolume`;
+            # older ones return a raw COM device that needs `.Activate(...)`.
+            volume = getattr(speakers, "EndpointVolume", None)
+            if volume is None:
+                interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = cast(interface, POINTER(IAudioEndpointVolume))
             volume.SetMasterVolumeLevelScalar(level / 100, None)
         except Exception as exc:  # noqa: BLE001 - normalize any driver/COM failure
             return ToolResult(success=False, error=f"Couldn't set volume: {exc}")
@@ -64,8 +68,11 @@ class TakeScreenshotTool(Tool):
 
     def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         path = payload.get("path", "screenshot.png")
-        if not isinstance(path, str):
+        if not isinstance(path, str) or not path:
             raise ValidationError("take_screenshot 'path' must be a string")
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            # Never let a "screenshot" overwrite scripts/configs with image bytes.
+            raise ValidationError("take_screenshot only writes .png/.jpg files")
         return {"path": path}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:

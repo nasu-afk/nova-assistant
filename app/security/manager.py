@@ -34,6 +34,20 @@ logger = get_logger(__name__)
 ConfirmationPrompt = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
 
+def summarize_payload(payload: Any, limit: int = 200) -> Any:
+    """Shorten long strings so a confirmation dialog stays readable (a
+    write_file call would otherwise dump the whole file into the prompt)."""
+    if isinstance(payload, str):
+        if len(payload) <= limit:
+            return payload
+        return f"{payload[:limit]}... (+{len(payload) - limit} more characters)"
+    if isinstance(payload, dict):
+        return {k: summarize_payload(v, limit) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [summarize_payload(v, limit) for v in payload]
+    return payload
+
+
 class PermissionManager:
     """Decides whether a risk level is allowed to run at all right now.
 
@@ -76,9 +90,11 @@ class ConfirmationManager:
         self._require_for = require_for
 
     async def confirm(self, tool: Tool, payload: dict[str, Any]) -> None:
-        needs_confirmation = tool.metadata.requires_confirmation or (
-            tool.metadata.risk_level in self._require_for
+        per_call = getattr(tool, "needs_confirmation", None)
+        static_flag = (
+            per_call(payload) if callable(per_call) else tool.metadata.requires_confirmation
         )
+        needs_confirmation = static_flag or (tool.metadata.risk_level in self._require_for)
         if not needs_confirmation:
             return
 
@@ -89,7 +105,7 @@ class ConfirmationManager:
                 user_message=f"I need your confirmation before I can {tool.metadata.name}.",
             )
 
-        approved = await self._prompt(tool.metadata.name, payload)
+        approved = await self._prompt(tool.metadata.name, summarize_payload(payload))
         if not approved:
             raise PermissionDeniedError(
                 f"User declined confirmation for {tool.metadata.name}.",
@@ -185,9 +201,7 @@ def _is_sensitive_key(key: object) -> bool:
 def _redact_payload(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): "[REDACTED]"
-            if _is_sensitive_key(key)
-            else _redact_payload(item)
+            str(key): "[REDACTED]" if _is_sensitive_key(key) else _redact_payload(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -273,21 +287,42 @@ class SecurityGate:
             raise
         self.audit.record(tool.metadata.name, payload, "allowed")
 
+    async def _audit(
+        self, tool_name: str, payload: dict[str, Any], outcome: str, detail: str = ""
+    ) -> None:
+        """Best-effort audit write: a failing audit store is logged loudly but
+        must not block a tool call or mask the real denial/confirmation error
+        (same policy the registry applies to outcome logging)."""
+        try:
+            await self.audit.record_async(tool_name, payload, outcome, detail)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "audit_persistence_failed", tool=tool_name, outcome=outcome, error=str(exc)
+            )
+
     async def check_and_confirm(self, tool: Tool, payload: dict[str, Any]) -> None:
-        """Full async gate: risk-level check, then confirmation if required."""
+        """Full async gate: risk-level check, then confirmation if required.
+
+        The audit trail records the *decision* (denied, or allowed/confirmed)
+        after the prompt resolves, not "allowed" before the user answered.
+        """
+        name = tool.metadata.name
         try:
             self.permissions.check(tool)
         except PermissionDeniedError as exc:
-            await self.audit.record_async(tool.metadata.name, payload, "denied", exc.message)
+            await self._audit(name, payload, "denied", exc.message)
             raise
-        await self.audit.record_async(tool.metadata.name, payload, "allowed")
+
+        per_call = getattr(tool, "needs_confirmation", None)
+        asked = per_call(payload) if callable(per_call) else tool.metadata.requires_confirmation
         try:
             await self.confirmations.confirm(tool, payload)
         except (ConfirmationRequiredError, PermissionDeniedError) as exc:
-            await self.audit.record_async(tool.metadata.name, payload, "denied", exc.message)
+            await self._audit(name, payload, "denied", exc.message)
             raise
-        if tool.metadata.requires_confirmation:
-            await self.audit.record_async(tool.metadata.name, payload, "confirmed")
+        await self._audit(name, payload, "allowed")
+        if asked:
+            await self._audit(name, payload, "confirmed")
 
     async def record_outcome(
         self, tool: Tool, payload: dict[str, Any], outcome: str, detail: str = ""

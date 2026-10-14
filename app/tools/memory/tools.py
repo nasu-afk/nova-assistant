@@ -50,11 +50,23 @@ class RememberFactTool(Tool):
         fact = payload.get("fact")
         if not fact or not isinstance(fact, str):
             raise ValidationError("remember_fact requires a 'fact' string")
-        return {"fact": fact, "category": payload.get("category", "general")}
+        fact = " ".join(fact.split())  # single line: facts end up inside the system prompt
+        if len(fact) > 500:
+            raise ValidationError("remember_fact: that's too long to store as a single fact.")
+        category = payload.get("category") or "general"
+        if not isinstance(category, str):
+            raise ValidationError("remember_fact 'category' must be a string")
+        return {"fact": fact, "category": category}
 
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
+        fact = payload["fact"].strip()
+        existing = {r.value.strip().lower() for r in await self._memory.list_all()}
+        if fact.lower() in existing:
+            # Saying the same thing twice must not pile up duplicate rows that
+            # later crowd the "last 30 facts" prompt window.
+            return ToolResult(success=True, message=f"I already knew that: {fact}")
         key = uuid4().hex[:12]
-        await self._memory.remember(key, payload["fact"], category=payload["category"])
+        await self._memory.remember(key, fact, category=payload["category"])
         return ToolResult(success=True, message=f"Got it, I'll remember that: {payload['fact']}")
 
 
@@ -62,8 +74,7 @@ class ListMemoriesTool(Tool):
     metadata: ClassVar[ToolMetadata] = ToolMetadata(
         name="list_memories",
         description=(
-            "List everything currently remembered about the user, optionally filtered "
-            "by category."
+            "List everything currently remembered about the user, optionally filtered by category."
         ),
         risk_level=RiskLevel.LOW,
         input_schema={
@@ -84,7 +95,7 @@ class ListMemoriesTool(Tool):
         records = await self._memory.list_all(category=payload.get("category"))
         facts = [{"id": r.id, "fact": r.value, "category": r.category} for r in records]
         if facts:
-            message = "; ".join(f["fact"] for f in facts)
+            message = "; ".join(f"[{f['id']}] {f['fact']}" for f in facts)
         else:
             message = "I don't have anything remembered yet."
         return ToolResult(success=True, data={"memories": facts}, message=message)

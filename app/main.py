@@ -22,7 +22,10 @@ import asyncio
 import sys
 from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError as PydanticValidationError
+
 from app.config.settings import get_settings
+from app.core.errors import NovaError
 from app.core.logging import configure_logging, get_logger
 
 if TYPE_CHECKING:
@@ -106,6 +109,17 @@ class _Stack:
     async def close(self) -> None:
         """Release background jobs and persistent resources owned by the stack."""
         self.scheduler.cancel_all()
+        # Tools holding external resources (e.g. the YouTube tool's Playwright
+        # browser + ad-skip task) expose `aclose()`; they were never closed before.
+        iter_tools = getattr(self.registry, "iter_tools", None)
+        for tool in iter_tools() if iter_tools else []:
+            closer = getattr(tool, "aclose", None)
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001 - keep shutting down
+                logger.error("tool_close_failed", tool=tool.metadata.name, error=str(exc))
         await self.database.dispose()
 
 
@@ -160,12 +174,16 @@ async def _build_stack(
     async def on_reminder_fire(message: str) -> None:
         text = f"Reminder: {message}"
         print(f"\n[reminder] {message}")
-        await tts.speak(text)
         if events is not None:
             # Also surface it in a GUI's conversation view, not just spoken —
             # RESPONSE_READY is exactly the event MainWindow already renders
-            # assistant text from (see app/ui/main_window.py).
+            # assistant text from (see app/ui/main_window.py). Done before
+            # speaking so a TTS failure can't hide the reminder.
             await events.publish(Event(type=EventType.RESPONSE_READY, payload={"text": text}))
+        try:
+            await tts.speak(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("reminder_speech_failed", error=str(exc))
 
     reminders = PersistentReminderManager(db, scheduler, on_reminder_fire)
     restored_reminders = await reminders.restore_pending()
@@ -183,6 +201,7 @@ async def _build_stack(
         on_reminder_fire=on_reminder_fire,
         reminders=reminders,
         audit=audit,
+        settings=settings,
     )
     agent = ToolCallingAgent(
         llm,
@@ -193,6 +212,30 @@ async def _build_stack(
     )
 
     return _Stack(agent, registry, stt, tts, memory, scheduler, llm, db)
+
+
+class _NoVoice(Exception):
+    """Internal control-flow marker: voice input isn't available in this run."""
+
+
+def _handle_captured_audio(
+    settings: Any,
+    audio_bytes: bytes,
+    debug_wav_path: Any,
+    quiet_threshold: float,
+) -> tuple[float, bool]:
+    """Shared by the console and GUI voice loops: log the recording's level and
+    keep a copy ONLY if the user opted in (`NOVA_DEBUG_SAVE_AUDIO`) or it was so
+    quiet that the "check your microphone" hint needs something to play back.
+    Returns (rms_level, is_quiet)."""
+    from app.voice.debug import rms_energy, save_debug_wav
+
+    energy = rms_energy(audio_bytes)
+    logger.info("voice_audio_captured", bytes=len(audio_bytes), rms=round(energy, 1))
+    is_quiet = energy < quiet_threshold
+    if settings.debug_save_audio or is_quiet:
+        save_debug_wav(debug_wav_path, audio_bytes)
+    return energy, is_quiet
 
 
 async def run_voice_loop() -> None:
@@ -226,7 +269,6 @@ async def run_voice_loop() -> None:
 
     from app.core.errors import NovaError
     from app.voice.audio_capture import MicrophoneRecorder
-    from app.voice.debug import rms_energy, save_debug_wav
     from app.voice.hotkey import PushToTalkListener
     from app.voice.pipeline import VoicePipeline
 
@@ -249,10 +291,10 @@ async def run_voice_loop() -> None:
     debug_wav_path = settings.data_dir / "debug_last_recording.wav"
 
     def on_audio_captured(audio_bytes: bytes) -> None:
-        energy = rms_energy(audio_bytes)
-        logger.info("voice_audio_captured", bytes=len(audio_bytes), rms=round(energy, 1))
-        save_debug_wav(debug_wav_path, audio_bytes)
-        if energy < quiet_threshold:
+        energy, is_quiet = _handle_captured_audio(
+            settings, audio_bytes, debug_wav_path, quiet_threshold
+        )
+        if is_quiet:
             print(
                 f"[warning] That recording was very quiet (level {energy:.0f}) — "
                 f"likely a microphone/input-device issue, not a NOVA bug. Play back "
@@ -273,11 +315,19 @@ async def run_voice_loop() -> None:
             logger.error("nova_turn_failed", error=exc.message)
             print(f"NOVA: (error) {exc.user_message}")
             return
+        except Exception as exc:  # noqa: BLE001 - never leave the user in silence
+            logger.error("nova_turn_crashed", error=repr(exc))
+            print("NOVA: (error) Something went wrong on my end. Please try again.")
+            return
         print(f"NOVA: {reply}" if reply else "(didn't catch that)")
 
     def on_start() -> None:
         print("\n[listening...]")
-        pipeline.start_listening()
+        try:
+            pipeline.start_listening()
+        except NovaError as exc:
+            logger.error("nova_listen_failed", error=exc.message)
+            print(f"(error) {exc.user_message}")
 
     def on_stop() -> None:
         print("[thinking...]")
@@ -383,14 +433,16 @@ async def run_wakeword_loop() -> None:
     pipeline = VoicePipeline(recorder, stack.stt, stack.tts, stack.agent)
     listener = BackgroundListener(
         recorder,
-        EnergyVAD(),
+        EnergyVAD(threshold=settings.wake_vad_threshold),
         wake_word=wake_word_engine.is_wake_word,
         pipeline=pipeline,
         on_command_complete=chunk_source.drain,
     )
 
     chunk_source.start()
-    trigger_phrase = settings.wake_word_model.replace("_", " ")
+    from pathlib import Path
+
+    trigger_phrase = Path(settings.wake_word_model).stem.replace("_", " ")
     print(f"NOVA is listening for the wake word — say '{trigger_phrase}'. Ctrl+C to quit.")
     try:
         await listener.run(chunk_source.get_chunk)
@@ -404,7 +456,9 @@ async def run_wakeword_loop() -> None:
         print("\nNOVA stopped.")
 
 
-async def _stay_open_after_setup_failure(window: Any, log_message: str, status: str) -> None:
+async def _stay_open_after_setup_failure(
+    window: Any, log_message: str, status: str, closed: asyncio.Event | None = None
+) -> None:
     """Log an error to the window and then block forever (until Ctrl+C or
     the window is closed) instead of returning immediately.
 
@@ -417,7 +471,8 @@ async def _stay_open_after_setup_failure(window: Any, log_message: str, status: 
     """
     window.append_log(log_message)
     window.set_status(status)
-    await asyncio.Event().wait()
+    # `closed` is set when the user closes the window; without it, wait forever.
+    await (closed or asyncio.Event()).wait()
 
 
 def run_gui_voice_loop() -> None:
@@ -468,12 +523,17 @@ def run_gui_voice_loop() -> None:
     from app.events.bus import EventBus
     from app.ui.main_window import MainWindow
     from app.voice.audio_capture import MicrophoneRecorder
-    from app.voice.debug import rms_energy, save_debug_wav
     from app.voice.hotkey import PushToTalkListener
     from app.voice.pipeline import VoicePipeline
 
     application = QApplication.instance() or QApplication(sys.argv)
+    # Closing the window must not stop Qt's loop out from under our coroutines:
+    # we signal `closed`, let run_inside_gui() clean up (hotkey listener, mic,
+    # DB, browser) and return, and only then does the loop end.
+    QApplication.setQuitOnLastWindowClosed(False)
     window = MainWindow()
+    closed = asyncio.Event()
+    window.closed.connect(closed.set)
     events = EventBus()
     window.wire_events(events)
 
@@ -488,88 +548,161 @@ def run_gui_voice_loop() -> None:
     asyncio.set_event_loop(loop)
 
     async def run_inside_gui() -> None:
-        stack = await _build_stack(
-            settings, events=events, confirmation_prompt=gui_confirmation_prompt
-        )
+        try:
+            stack = await _build_stack(
+                settings, events=events, confirmation_prompt=gui_confirmation_prompt
+            )
+        except Exception as exc:  # noqa: BLE001 - show it in the window, don't just vanish
+            logger.error("nova_startup_failed", error=repr(exc))
+            await _stay_open_after_setup_failure(
+                window, f"Startup failed: {exc}", "Startup failed", closed
+            )
+            return
 
+        recorder: MicrophoneRecorder | None
         try:
             recorder = MicrophoneRecorder()
         except NovaError as exc:
+            # Not fatal: without a microphone the window is still a fully working
+            # text assistant (typed requests), just with voice switched off.
             logger.error("nova_mic_unavailable", error=exc.message)
-            try:
-                await _stay_open_after_setup_failure(
-                    window,
-                    f"Microphone isn't available: {exc.user_message}",
-                    "Microphone unavailable",
-                )
-            finally:
-                await stack.close()
-            return
+            recorder = None
+            window.set_voice_available(False, exc.user_message)
+            window.append_log(
+                f"Microphone isn't available: {exc.user_message} — typing still works."
+            )
 
         quiet_threshold = 150.0
         debug_wav_path = settings.data_dir / "debug_last_recording.wav"
 
         def on_audio_captured(audio_bytes: bytes) -> None:
-            energy = rms_energy(audio_bytes)
-            logger.info("voice_audio_captured", bytes=len(audio_bytes), rms=round(energy, 1))
-            save_debug_wav(debug_wav_path, audio_bytes)
+            energy, is_quiet = _handle_captured_audio(
+                settings, audio_bytes, debug_wav_path, quiet_threshold
+            )
             window.append_log(f"Captured {len(audio_bytes)} bytes (level {energy:.0f})")
-            if energy < quiet_threshold:
+            if is_quiet:
                 window.append_log(
                     f"Very quiet recording (level {energy:.0f}) — check your microphone."
                 )
 
-        pipeline = VoicePipeline(
-            recorder,
-            stack.stt,
-            stack.tts,
-            stack.agent,
-            on_audio_captured=on_audio_captured,
-            events=events,
+        pipeline: VoicePipeline | None = (
+            VoicePipeline(
+                recorder,
+                stack.stt,
+                stack.tts,
+                stack.agent,
+                on_audio_captured=on_audio_captured,
+                events=events,
+            )
+            if recorder is not None
+            else None
         )
 
         turn_loop = asyncio.get_running_loop()
 
         async def handle_turn() -> None:
+            if pipeline is None:
+                return
             try:
                 await pipeline.stop_listening_and_respond()
             except NovaError as exc:
                 logger.error("nova_turn_failed", error=exc.message)
                 window.append_log(f"Error: {exc.user_message}")
+            except Exception as exc:  # noqa: BLE001 - otherwise the status sticks on "Thinking"
+                logger.error("nova_turn_crashed", error=repr(exc))
+                window.append_log("Error: something went wrong on my end. Please try again.")
+            finally:
+                # Every outcome ends at Idle. Previously only the error paths did,
+                # so after a normal reply the window stayed on "SPEAKING" (and
+                # after a silent press on "THINKING") until the next turn.
                 window.set_status("Idle")
 
         def on_start() -> None:
-            pipeline.start_listening()
+            if pipeline is None:
+                return
+            try:
+                pipeline.start_listening()
+            except NovaError as exc:
+                logger.error("nova_listen_failed", error=exc.message)
+                window.append_log(f"Error: {exc.user_message}")
+                return
             asyncio.run_coroutine_threadsafe(pipeline.publish_started(), turn_loop)
 
         def on_stop() -> None:
+            if pipeline is None:
+                return
             asyncio.run_coroutine_threadsafe(handle_turn(), turn_loop)
 
+        async def handle_typed(text: str, speak: bool) -> None:
+            """A typed request: same agent, text reply (spoken only if asked)."""
+            window.append_conversation("You", text)
+            window.set_status("Thinking")
+            try:
+                reply = await stack.agent.respond(text)
+                if speak and reply:
+                    try:
+                        await stack.tts.speak(reply)
+                    except Exception as exc:  # noqa: BLE001 - the text reply is already shown
+                        logger.error("typed_reply_speech_failed", error=str(exc))
+            except NovaError as exc:
+                logger.error("nova_typed_turn_failed", error=exc.message)
+                window.append_log(f"Error: {exc.user_message}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("nova_typed_turn_crashed", error=repr(exc))
+                window.append_log("Error: something went wrong on my end. Please try again.")
+            finally:
+                window.set_status("Idle")
+
+        # Keep a reference to in-flight typed turns: asyncio only holds weak
+        # references to tasks, so a fire-and-forget task can be collected mid-run.
+        typed_tasks: set[asyncio.Task[None]] = set()
+
+        def on_text_submitted(text: str, speak: bool) -> None:
+            task = asyncio.ensure_future(handle_typed(text, speak))
+            typed_tasks.add(task)
+            task.add_done_callback(typed_tasks.discard)
+
+        # The on-screen controls work no matter what the global hotkey does:
+        # the talk button was previously a dead control (never connected), and
+        # there was no way to type a request at all.
+        window.talk_pressed.connect(on_start)
+        window.talk_released.connect(on_stop)
+        window.text_submitted.connect(on_text_submitted)
+
+        hotkey_listener: PushToTalkListener | None = None
         try:
+            if recorder is None:
+                raise _NoVoice
             hotkey_listener = PushToTalkListener(
                 settings.push_to_talk_key, on_start=on_start, on_stop=on_stop
             )
             hotkey_listener.start()
+        except _NoVoice:
+            pass  # already explained above; nothing to bind a hotkey to
         except NovaError as exc:
+            # Not fatal any more: the button and the text box still work.
             logger.error("nova_hotkey_unavailable", error=exc.message)
-            recorder.close()
-            try:
-                await _stay_open_after_setup_failure(
-                    window,
-                    f"Push-to-talk isn't available: {exc.user_message}",
-                    "Push-to-talk unavailable",
-                )
-            finally:
-                await stack.close()
-            return
+            hotkey_listener = None
+            window.append_log(
+                f"Global hotkey unavailable ({exc.user_message}) — "
+                "use the on-screen button or type your request."
+            )
 
         window.set_status("Idle")
-        window.append_log(f"Ready — hold '{settings.push_to_talk_key}' to talk.")
+        if recorder is None:
+            window.append_log("Ready — type a request below.")
+        elif hotkey_listener is not None:
+            window.append_log(
+                f"Ready — hold '{settings.push_to_talk_key}' or the on-screen button to talk, "
+                "or type a request."
+            )
         try:
-            await asyncio.Event().wait()
+            await closed.wait()
         finally:
-            hotkey_listener.stop()
-            recorder.close()
+            if hotkey_listener is not None:
+                hotkey_listener.stop()
+            if recorder is not None:
+                recorder.close()
             await stack.close()
 
     window.show()
@@ -579,14 +712,27 @@ def run_gui_voice_loop() -> None:
 
 def main() -> None:
     """Synchronous entrypoint for console scripts / `python -m app.main`."""
-    if "--gui" in sys.argv:
-        run_gui_voice_loop()
-    elif "--wakeword" in sys.argv:
-        asyncio.run(run_wakeword_loop())
-    elif "--voice" in sys.argv:
-        asyncio.run(run_voice_loop())
-    else:
-        asyncio.run(run())
+    try:
+        if "--gui" in sys.argv:
+            run_gui_voice_loop()
+        elif "--wakeword" in sys.argv:
+            asyncio.run(run_wakeword_loop())
+        elif "--voice" in sys.argv:
+            asyncio.run(run_voice_loop())
+        else:
+            asyncio.run(run())
+    except KeyboardInterrupt:
+        # asyncio.run() re-raises Ctrl+C after cancelling the main task (cleanup
+        # in the loops' `finally` blocks has already run); exit quietly.
+        print("\nBye.")
+    except NovaError as exc:
+        # Misconfiguration (missing key, bad provider ...) deserves one clear
+        # line, not a stack trace.
+        print(f"\nNOVA couldn't start: {exc.user_message}\n")
+        raise SystemExit(1) from None
+    except PydanticValidationError as exc:
+        print(f"\nNOVA couldn't start: invalid settings in .env / environment:\n{exc}\n")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

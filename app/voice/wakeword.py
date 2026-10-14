@@ -26,6 +26,7 @@ from __future__ import annotations
 import array
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from app.core.errors import NovaError, VoiceError
@@ -67,9 +68,10 @@ class WakeWordEngine:
     "nova" model, and no way to make it respond to an arbitrary phrase
     without training a custom model — that's a separate, much more involved
     process (openwakeword's own training notebook, ~100k synthetic
-    text-to-speech clips) that this project doesn't attempt. Pick one of the
-    four above via `wakeword_model` (default `hey_jarvis`) and say *that*
-    phrase, not "Hey NOVA".
+    text-to-speech clips) that this project doesn't attempt. Either pick one
+    of the four above via `wakeword_model` (default `hey_jarvis`) and say
+    *that* phrase, or train your own model for "Hey NOVA" and pass the path to
+    the resulting `.onnx`/`.tflite` file as `wakeword_model`.
 
     `listen_for_wake_word` is intentionally not implemented against real
     hardware here — it operates on audio chunks handed to `score_chunk` by
@@ -91,16 +93,30 @@ class WakeWordEngine:
                 user_message="Always-listening mode isn't set up yet.",
             ) from exc
 
-        if wakeword_model not in self.PRETRAINED_MODELS:
-            raise VoiceError(
-                f"'{wakeword_model}' is not one of openwakeword's pretrained models "
-                f"({', '.join(self.PRETRAINED_MODELS)}).",
-                user_message=(
-                    f"'{wakeword_model}' isn't a real wake word model — openwakeword only "
-                    f"ships {', '.join(self.PRETRAINED_MODELS)}. Set NOVA_WAKE_WORD_MODEL to "
-                    "one of those (say that phrase, not 'Hey NOVA')."
-                ),
-            )
+        custom_path = self._custom_model_path(wakeword_model)
+        if custom_path is not None:
+            # A model you trained yourself (e.g. "Hey NOVA" via openWakeWord's
+            # training notebook). Pretrained names don't apply; the shared
+            # feature models still have to be present, and downloading any
+            # pretrained model fetches them.
+            model_arg = str(custom_path)
+            framework = "onnx" if custom_path.suffix.lower() == ".onnx" else "tflite"
+            download_names = ["alexa"]
+        else:
+            if wakeword_model not in self.PRETRAINED_MODELS:
+                raise VoiceError(
+                    f"'{wakeword_model}' is not one of openwakeword's pretrained models "
+                    f"({', '.join(self.PRETRAINED_MODELS)}).",
+                    user_message=(
+                        f"'{wakeword_model}' isn't a ready-made wake word model — openwakeword "
+                        f"only ships {', '.join(self.PRETRAINED_MODELS)}. Set "
+                        "NOVA_WAKE_WORD_MODEL to one of those, or to the path of a custom "
+                        ".onnx/.tflite model you trained for your own phrase (such as 'Hey NOVA')."
+                    ),
+                )
+            model_arg = wakeword_model
+            framework = None
+            download_names = [wakeword_model]
 
         try:
             # Idempotent: only downloads the file(s) if not already cached
@@ -108,7 +124,7 @@ class WakeWordEngine:
             # it just fails with "could not find pretrained model" if the
             # weights aren't present yet, which looks identical to typing
             # the name wrong and is confusing to debug from that error alone.
-            download_models(model_names=[wakeword_model])
+            download_models(model_names=download_names)
         except Exception as exc:  # noqa: BLE001 - network failure, disk, etc.
             raise VoiceError(
                 f"Failed to download the '{wakeword_model}' wake-word model: {exc}",
@@ -118,9 +134,27 @@ class WakeWordEngine:
                 ),
             ) from exc
 
-        self._model: Any = Model(wakeword_models=[wakeword_model])
+        kwargs: dict[str, Any] = {"wakeword_models": [model_arg]}
+        if framework is not None:
+            kwargs["inference_framework"] = framework
+        self._model: Any = Model(**kwargs)
         self._wakeword_model = wakeword_model
         self._threshold = threshold
+
+    @staticmethod
+    def _custom_model_path(name: str) -> Path | None:
+        """Return the path if `name` refers to a custom model file, else None.
+        A name that *looks* like a model file but doesn't exist is an error,
+        not a silent fallback to a pretrained model."""
+        if not name.lower().endswith((".onnx", ".tflite")):
+            return None
+        path = Path(name).expanduser()
+        if not path.is_file():
+            raise VoiceError(
+                f"Custom wake-word model file not found: {path}",
+                user_message=f"I couldn't find the wake-word model file '{path}'.",
+            )
+        return path
 
     def score_chunk(self, pcm16_bytes: bytes) -> float:
         import numpy as np
@@ -178,6 +212,9 @@ class BackgroundListener:
         # through a backlog of audio queued during the command window.
         self._on_command_complete = on_command_complete
         self._running = False
+        # Was the previous chunk speech? A phrase can end just after a chunk
+        # boundary, so a hit counts if speech is in this chunk *or* the last.
+        self._previous_was_speech = False
 
     def stop(self) -> None:
         self._running = False
@@ -185,9 +222,17 @@ class BackgroundListener:
     async def run_once(self, chunk: bytes) -> str | None:
         """Process a single monitoring chunk. Returns the agent's reply text
         if the wake word triggered a full turn, else None."""
-        if not self._vad.is_speech(chunk):
-            return None
-        if not self._wake_word(chunk):
+        # ALWAYS feed the model, even for quiet chunks. openwakeword keeps rolling
+        # audio state between calls; skipping chunks (as the old loudness gate
+        # did, averaged over a whole second) cut phrases in half and made
+        # detection depend on how loud the first syllable happened to be.
+        # The loudness check now only validates a detection, which still
+        # screens out the model "hearing" a wake word in near-silence.
+        hit = self._wake_word(chunk)
+        is_speech = self._vad.is_speech(chunk)
+        heard_speech = is_speech or self._previous_was_speech
+        self._previous_was_speech = is_speech
+        if not hit or not heard_speech:
             return None
 
         logger.info("wake_word_detected")
@@ -203,6 +248,9 @@ class BackgroundListener:
             # handles this correctly for push-to-talk; this brings wake-word
             # mode to the same standard.
             logger.error("wake_word_turn_failed", error=exc.message)
+            return None
+        except Exception as exc:  # noqa: BLE001 - same reasoning, for non-NovaError failures
+            logger.error("wake_word_turn_crashed", error=repr(exc))
             return None
         finally:
             if self._on_command_complete is not None:

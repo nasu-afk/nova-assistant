@@ -64,7 +64,11 @@ class GroqProvider(BaseLLMProvider):
         # Groq's chat API takes the same {role, content} shape as OpenAI,
         # system messages included inline — no splitting needed (unlike
         # Anthropic's separate top-level `system` field).
-        return [{"role": m.role, "content": cls._to_openai_content(m)} for m in messages]
+        # Native "tool" turns need a tool_call_id we don't carry; send them as user text.
+        return [
+            {"role": "user" if m.role == "tool" else m.role, "content": cls._to_openai_content(m)}
+            for m in messages
+        ]
 
     @staticmethod
     def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -109,7 +113,7 @@ class GroqProvider(BaseLLMProvider):
                     f"Groq model '{self._model}' is not available on this account: {exc}",
                     user_message=(
                         f"The model '{self._model}' isn't available right now. Run "
-                        "`uv run python -c \"from groq import Groq; c = Groq(); "
+                        '`uv run python -c "from groq import Groq; c = Groq(); '
                         "print('\\n'.join(sorted(m.id for m in c.models.list().data)))\"` "
                         "to see which models your key can use, then update NOVA_LLM_MODEL."
                     ),

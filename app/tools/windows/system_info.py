@@ -8,6 +8,7 @@ as on the target Windows deployment — only the OS-*specific* tools
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import time
 from typing import Any, ClassVar
@@ -15,6 +16,7 @@ from typing import Any, ClassVar
 import psutil
 
 from app.core.enums import RiskLevel
+from app.core.errors import ValidationError
 from app.tools.base import Tool, ToolMetadata, ToolResult
 
 
@@ -54,21 +56,49 @@ class GetProcessesTool(Tool):
         },
     )
 
+    def validate_input(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw = payload.get("limit", 20)
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValidationError("get_processes 'limit' must be an integer") from exc
+        return {"limit": max(1, min(limit, 100))}
+
     async def execute(self, payload: dict[str, Any]) -> ToolResult:
-        limit = int(payload.get("limit", 20))
-        processes = []
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+        limit = payload.get("limit", 20)
+        # psutil reports 0.0 for a process the first time cpu_percent() is called,
+        # so sampling once made the "top by CPU" list arbitrary. Prime every
+        # process, wait a moment, then read the real usage over that window.
+        procs: list[psutil.Process] = []
+        for proc in psutil.process_iter(["pid", "name"]):
             try:
-                processes.append(proc.info)
+                proc.cpu_percent(None)
+                procs.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        await asyncio.sleep(0.3)
+
+        processes: list[dict[str, Any]] = []
+        for proc in procs:
+            try:
+                processes.append(
+                    {
+                        "pid": proc.pid,
+                        "name": proc.info.get("name"),
+                        "cpu_percent": proc.cpu_percent(None),
+                        "memory_percent": round(proc.memory_percent(), 2),
+                    }
+                )
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        processes.sort(key=lambda p: p.get("cpu_percent") or 0.0, reverse=True)
+        processes.sort(key=lambda p: p["cpu_percent"], reverse=True)
         top = processes[:limit]
+        summary = ", ".join(f"{p['name']} ({p['cpu_percent']:.0f}%)" for p in top[:5])
         return ToolResult(
             success=True,
             data={"processes": top, "total_count": len(processes)},
-            message=f"Found {len(processes)} running processes.",
+            message=f"Found {len(processes)} running processes. Top by CPU: {summary}.",
         )
 
 
@@ -103,6 +133,4 @@ class GetMemoryUsageTool(Tool):
             "available_gb": round(mem.available / (1024**3), 2),
             "percent": mem.percent,
         }
-        return ToolResult(
-            success=True, data=data, message=f"Memory usage is {data['percent']}%."
-        )
+        return ToolResult(success=True, data=data, message=f"Memory usage is {data['percent']}%.")
